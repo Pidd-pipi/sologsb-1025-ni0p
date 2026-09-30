@@ -17,10 +17,11 @@ import {
   NbToastrService
 } from '@nebular/theme';
 
-type WorkspaceView = 'compose' | 'checks' | 'review' | 'versions';
+type WorkspaceView = 'compose' | 'checks' | 'review' | 'versions' | 'merge';
 type ReviewStatus = 'pending' | 'approved' | 'changes';
 type NoticeStatus = 'draft' | 'in-review' | 'locked';
 type CheckLevel = 'error' | 'warning' | 'info';
+type ChangeKind = 'meta' | 'language';
 
 interface LanguageVersion {
   id: string;
@@ -87,6 +88,81 @@ interface NoticeDraft {
   lockedAt?: string;
   emergencyRevision: boolean;
   updatedAt: string;
+  /** 离线修订包合并：待复核稿（冲突裁决前不生成正式新稿）。旧数据无此字段。 */
+  pendingReview?: PendingReview;
+  /** 已导入过的修订包 ID，用于重复导入识别。 */
+  importedPackageIds?: string[];
+  /** 字段改动后发布前检查失效，需重新执行确认的时间戳。 */
+  checksConfirmedAt?: string;
+}
+
+/** 离线修订包：外勤断网期间基于某一锁定稿填写，只携带实际改过的字段。 */
+interface RevisionChange {
+  key: string;
+  kind: ChangeKind;
+  locale?: string;
+  field: string;
+  label: string;
+  baseValue: string;
+  newValue: string;
+}
+
+interface RevisionPackage {
+  kind: typeof REVISION_PACKAGE_KIND;
+  id: string;
+  noticeId: string;
+  baseVersionId: string;
+  baseVersion: string;
+  createdAt: string;
+  author: string;
+  note?: string;
+  changes: RevisionChange[];
+  checksum: string;
+}
+
+/** 待复核稿中一项无冲突改动。 */
+interface PendingChange {
+  key: string;
+  kind: ChangeKind;
+  locale?: string;
+  field: string;
+  label: string;
+  baseValue: string;
+  newValue: string;
+  packageId: string;
+  author: string;
+}
+
+/** 同一字段出现两种（及以上）新值时的待决冲突。 */
+interface ConflictCandidate {
+  packageId: string;
+  author: string;
+  createdAt: string;
+  note?: string;
+  value: string;
+}
+
+interface PendingConflict {
+  id: string;
+  key: string;
+  kind: ChangeKind;
+  locale?: string;
+  field: string;
+  label: string;
+  baseValue: string;
+  candidates: ConflictCandidate[];
+  selectedPackageId?: string;
+  customValue?: string;
+}
+
+interface PendingReview {
+  id: string;
+  createdAt: string;
+  baseVersionId: string;
+  baseVersion: string;
+  packages: RevisionPackage[];
+  changes: PendingChange[];
+  conflicts: PendingConflict[];
 }
 
 interface CheckResult {
@@ -116,6 +192,7 @@ interface NoticeTemplate {
 }
 
 const STORAGE_KEY = 'sologsb-1025-emergency-notice-v1';
+const REVISION_PACKAGE_KIND = 'emergency-notice/revision-package';
 
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 
@@ -313,6 +390,17 @@ export class AppComponent implements OnInit {
   history: NoticeDraft[] = [];
   future: NoticeDraft[] = [];
 
+  // 离线修订包：导入与待复核合并
+  importText = '';
+  lastImportResult: { ok: boolean; message: string } | null = null;
+  // 离线修订包生成器（模拟外勤断网填写）
+  builderBaseVersionId = '';
+  builderAuthor = '';
+  builderNote = '';
+  builderTitle = '';
+  builderScope = '';
+  builderLanguageDrafts: Record<string, { title: string; body: string }> = {};
+
   constructor(private readonly toastr: NbToastrService) {}
 
   ngOnInit(): void {
@@ -328,6 +416,7 @@ export class AppComponent implements OnInit {
     this.compareBaseId = this.draft.versions.at(-2)?.id ?? '';
     this.compareTargetId = this.draft.versions.at(-1)?.id ?? '';
     this.lastSavedAt = this.formatDateTime(this.draft.updatedAt);
+    this.selectBuilderBase(this.draft.versions.at(-1)?.id ?? '');
   }
 
   @HostListener('window:keydown', ['$event'])
@@ -570,6 +659,16 @@ export class AppComponent implements OnInit {
       this.activeView = 'checks';
       return;
     }
+    if (!this.allReviewsApproved) {
+      this.toastr.warning('仍有责任角色未重新确认，不能锁定。', '责任确认未完成');
+      this.activeView = 'review';
+      return;
+    }
+    if (this.draft.emergencyRevision && !this.draft.checksConfirmedAt) {
+      this.toastr.warning('字段改动后发布前检查已失效，请重新执行检查确认后再锁定。', '检查已失效');
+      this.activeView = 'checks';
+      return;
+    }
     const snapshot: VersionSnapshot = {
       id: uid('version'), label: '最终锁定版本', createdAt: new Date().toISOString(), version: this.nextVersion,
       title: this.draft.title, severity: this.draft.severity, scope: this.draft.scope, eventAt: this.draft.eventAt,
@@ -636,6 +735,484 @@ export class AppComponent implements OnInit {
     this.persist();
   }
 
+  // ── 离线修订包：生成（外勤断网填写） ──────────────────────────────
+
+  get builderBaseSnapshot(): VersionSnapshot | undefined {
+    return this.draft.versions.find((version) => version.id === this.builderBaseVersionId) ?? this.draft.versions.at(-1);
+  }
+
+  selectBuilderBase(versionId: string): void {
+    const snapshot = this.draft.versions.find((version) => version.id === versionId);
+    if (!snapshot) return;
+    this.builderBaseVersionId = snapshot.id;
+    this.builderTitle = snapshot.title;
+    this.builderScope = snapshot.scope;
+    this.builderLanguageDrafts = {};
+    snapshot.languages.forEach((language) => {
+      this.builderLanguageDrafts[language.id] = { title: language.title, body: language.body };
+    });
+  }
+
+  setBuilderLanguage(localeId: string, field: 'title' | 'body', value: string): void {
+    const current = this.builderLanguageDrafts[localeId];
+    if (!current) return;
+    this.builderLanguageDrafts[localeId] = { ...current, [field]: value };
+  }
+
+  builderLanguageValue(localeId: string, field: 'title' | 'body'): string {
+    return this.builderLanguageDrafts[localeId]?.[field] ?? '';
+  }
+
+  /** 与锁定稿相比实际改过的字段；修订包只携带这些字段。 */
+  get builderChanges(): RevisionChange[] {
+    const snapshot = this.builderBaseSnapshot;
+    if (!snapshot) return [];
+    const changes: RevisionChange[] = [];
+    if (this.builderTitle !== snapshot.title) {
+      changes.push({ key: 'meta:title', kind: 'meta', field: 'title', label: '通知标题', baseValue: snapshot.title, newValue: this.builderTitle });
+    }
+    if (this.builderScope !== snapshot.scope) {
+      changes.push({ key: 'meta:scope', kind: 'meta', field: 'scope', label: '影响范围', baseValue: snapshot.scope, newValue: this.builderScope });
+    }
+    snapshot.languages.forEach((language) => {
+      const draft = this.builderLanguageDrafts[language.id];
+      if (!draft) return;
+      if (draft.title !== language.title) {
+        changes.push({
+          key: `lang:${language.id}:title`, kind: 'language', locale: language.id, field: 'title',
+          label: `${language.name}标题`, baseValue: language.title, newValue: draft.title
+        });
+      }
+      if (draft.body !== language.body) {
+        changes.push({
+          key: `lang:${language.id}:body`, kind: 'language', locale: language.id, field: 'body',
+          label: `${language.name}正文`, baseValue: language.body, newValue: draft.body
+        });
+      }
+    });
+    return changes;
+  }
+
+  private buildRevisionPackage(): RevisionPackage | null {
+    const snapshot = this.builderBaseSnapshot;
+    if (!snapshot) return null;
+    const changes = this.builderChanges;
+    if (!changes.length) {
+      this.toastr.warning('当前没有任何改动，修订包为空，不能导出。', '无可合并内容');
+      return null;
+    }
+    const pkg: RevisionPackage = {
+      kind: REVISION_PACKAGE_KIND,
+      id: uid('pkg'),
+      noticeId: this.draft.id,
+      baseVersionId: snapshot.id,
+      baseVersion: snapshot.version,
+      createdAt: new Date().toISOString(),
+      author: this.builderAuthor.trim() || '外勤人员',
+      note: this.builderNote.trim() || undefined,
+      changes,
+      checksum: ''
+    };
+    pkg.checksum = this.checksum(pkg);
+    return pkg;
+  }
+
+  exportRevisionPackage(): void {
+    const pkg = this.buildRevisionPackage();
+    if (!pkg) return;
+    const blob = new Blob([JSON.stringify(pkg, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `revision-package-${pkg.id}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+    this.toastr.success('修订包已导出，联网后可在「离线合并」中导入。', '离线包已生成');
+  }
+
+  copyRevisionPackage(): void {
+    const pkg = this.buildRevisionPackage();
+    if (!pkg) return;
+    const text = JSON.stringify(pkg, null, 2);
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(text)
+        .then(() => this.toastr.success('修订包 JSON 已复制到剪贴板。', '已复制'))
+        .catch(() => this.toastr.info('复制失败，请改用导出包文件。'));
+    } else {
+      this.toastr.info('当前环境不支持剪贴板，请改用导出包文件。');
+    }
+  }
+
+  // ── 离线修订包：导入、校验与合并 ─────────────────────────────────
+
+  get pendingReview(): PendingReview | undefined {
+    return this.draft.pendingReview;
+  }
+
+  get pendingChanges(): PendingChange[] {
+    return this.draft.pendingReview?.changes ?? [];
+  }
+
+  get pendingConflicts(): PendingConflict[] {
+    return this.draft.pendingReview?.conflicts ?? [];
+  }
+
+  get pendingPackages(): RevisionPackage[] {
+    return this.draft.pendingReview?.packages ?? [];
+  }
+
+  get unresolvedConflictCount(): number {
+    return this.pendingConflicts.filter((conflict) => !conflict.selectedPackageId && !(conflict.customValue ?? '').trim()).length;
+  }
+
+  get allConflictsResolved(): boolean {
+    return !!this.draft.pendingReview && this.unresolvedConflictCount === 0;
+  }
+
+  onPackageFileSelected(event: Event): void {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      this.importText = String(reader.result ?? '');
+      this.importRevisionPackage();
+    };
+    reader.readAsText(file);
+    input.value = '';
+  }
+
+  importRevisionPackage(): void {
+    const raw = this.importText.trim();
+    if (!raw) {
+      this.lastImportResult = { ok: false, message: '请先粘贴修订包 JSON 内容，或选择 .json 包文件导入。' };
+      return;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      this.lastImportResult = { ok: false, message: '包损坏：内容不是有效的 JSON，文件可能已损坏或被截断。' };
+      return;
+    }
+    const validation = this.validatePackage(parsed);
+    if (!validation.ok) {
+      this.lastImportResult = { ok: false, message: validation.message };
+      return;
+    }
+    const pkg = validation.package;
+    // 同一包重复导入
+    if (this.draft.importedPackageIds?.includes(pkg.id) || this.draft.pendingReview?.packages.some((item) => item.id === pkg.id)) {
+      this.lastImportResult = { ok: false, message: `重复导入：修订包 ${pkg.id} 已经导入过，不能重复合并。` };
+      return;
+    }
+    // 基础版本：必须来自当前锁定稿（或待复核稿所基于的锁定稿）
+    const expectedBaseId = this.draft.pendingReview?.baseVersionId
+      ?? (this.draft.status === 'locked' ? this.draft.versions.at(-1)?.id : undefined);
+    if (!expectedBaseId) {
+      this.lastImportResult = { ok: false, message: '当前没有可合并的锁定稿：离线修订包必须基于某一锁定版本，请先完成发布检查并锁定。' };
+      return;
+    }
+    if (pkg.noticeId !== this.draft.id) {
+      this.lastImportResult = { ok: false, message: `基础版本不匹配：该包属于通知 ${pkg.noticeId}，不是本通知（${this.draft.id}）的修订包。` };
+      return;
+    }
+    if (pkg.baseVersionId !== expectedBaseId) {
+      const expected = this.draft.versions.find((version) => version.id === expectedBaseId);
+      this.lastImportResult = {
+        ok: false,
+        message: `基础版本已过期：修订包基于锁定稿 ${pkg.baseVersion}（${pkg.baseVersionId}），当前锁定稿为 ${expected?.version ?? '未知'}（${expectedBaseId}），旧包不能合并到新稿。`
+      };
+      return;
+    }
+    // 包内字段原值必须与锁定稿一致，否则包基于其他草稿
+    const snapshot = this.draft.versions.find((version) => version.id === pkg.baseVersionId);
+    if (!snapshot) {
+      this.lastImportResult = { ok: false, message: `基础版本已过期：修订包引用的锁定稿 ${pkg.baseVersion} 不在当前版本链中。` };
+      return;
+    }
+    for (const change of pkg.changes) {
+      const expectedValue = this.snapshotValue(snapshot, change);
+      if (expectedValue === undefined || expectedValue !== change.baseValue) {
+        this.lastImportResult = { ok: false, message: `包损坏：改动「${change.label}」的原值与锁定稿 ${snapshot.version} 不一致，包可能基于其他草稿或已被篡改。` };
+        return;
+      }
+    }
+    const { added, conflicts } = this.mergePackage(pkg);
+    this.importText = '';
+    this.lastImportResult = {
+      ok: true,
+      message: `导入成功：${pkg.author} 基于锁定稿 ${pkg.baseVersion}，携带 ${pkg.changes.length} 项改动；${added} 项无冲突进入待复核稿，${conflicts} 项与已有改动冲突，已列为待决冲突。`
+    };
+  }
+
+  selectConflictCandidate(conflict: PendingConflict, packageId: string): void {
+    this.commit((draft) => {
+      const target = draft.pendingReview?.conflicts.find((item) => item.id === conflict.id);
+      if (target) {
+        target.selectedPackageId = packageId;
+        target.customValue = '';
+      }
+    });
+  }
+
+  setConflictCustom(conflict: PendingConflict, value: string): void {
+    this.commit((draft) => {
+      const target = draft.pendingReview?.conflicts.find((item) => item.id === conflict.id);
+      if (target) {
+        target.customValue = value;
+        if (value.trim()) target.selectedPackageId = undefined;
+      }
+    });
+  }
+
+  /** 冲突全部裁决后，把待复核稿合并为正式修订稿；处理前不能生成。 */
+  applyPendingReview(): void {
+    const review = this.draft.pendingReview;
+    if (!review) return;
+    if (!this.allConflictsResolved) {
+      this.toastr.warning(`仍有 ${this.unresolvedConflictCount} 项冲突待决，处理完成后才能生成正式修订稿。`, '冲突未解决');
+      return;
+    }
+    this.commit((draft) => {
+      const pending = draft.pendingReview;
+      if (!pending) return;
+      const applied: Array<{ key: string; kind: ChangeKind; locale?: string; field: string; label: string; value: string }> = [];
+      pending.changes.forEach((change) => applied.push({
+        key: change.key, kind: change.kind, locale: change.locale, field: change.field, label: change.label, value: change.newValue
+      }));
+      pending.conflicts.forEach((conflict) => {
+        const custom = conflict.customValue?.trim();
+        const candidate = conflict.candidates.find((item) => item.packageId === conflict.selectedPackageId);
+        const value = custom || candidate?.value;
+        if (value == null) return;
+        applied.push({ key: conflict.key, kind: conflict.kind, locale: conflict.locale, field: conflict.field, label: conflict.label, value });
+      });
+
+      const affectedLocales = new Set<string>();
+      let metaChanged = false;
+      applied.forEach((item) => {
+        if (item.kind === 'meta') {
+          (draft as unknown as Record<string, string>)[item.field] = item.value;
+          metaChanged = true;
+        } else {
+          const language = draft.languages.find((item2) => item2.id === item.locale);
+          if (!language) return;
+          (language as unknown as Record<string, string>)[item.field] = item.value;
+          language.reviewed = false;
+          affectedLocales.add(item.locale ?? '');
+        }
+      });
+
+      // 锁定稿 → 修订稿：版本号推进，原锁定版本完整保留
+      if (draft.status === 'locked') {
+        const [major = 1, minor = 0] = draft.version.split('-')[0].split('.').map(Number);
+        draft.version = `${major}.${minor + 1}.0-emergency`;
+        draft.lockedAt = undefined;
+      }
+      draft.status = 'draft';
+      draft.emergencyRevision = true;
+      // 发布前检查失效，需重新执行确认
+      draft.checksConfirmedAt = undefined;
+      // 责任角色按受影响范围重新确认
+      const rolesToReset = new Set<RoleReview['role']>();
+      if (metaChanged) rolesToReset.add('编辑');
+      if (applied.some((item) => item.kind === 'language')) {
+        rolesToReset.add('法务');
+        rolesToReset.add('翻译');
+      }
+      rolesToReset.add('发布人');
+      draft.reviews.forEach((reviewItem) => {
+        if (rolesToReset.has(reviewItem.role)) reviewItem.status = 'pending';
+      });
+      draft.pendingReview = undefined;
+    });
+    this.activeView = 'checks';
+    this.toastr.success('离线改动已合并为正式修订稿：受影响语言已失效、发布前检查已失效，相关角色重新确认后才能再次锁定。', '已生成修订稿');
+  }
+
+  /** 字段改动后发布前检查失效，值班员重新执行并确认。 */
+  reconfirmChecks(): void {
+    if (this.blockingChecks.length) {
+      this.toastr.warning(`仍有 ${this.blockingChecks.length} 项阻断问题，不能确认检查结果。`, '检查未通过');
+      return;
+    }
+    this.commit((draft) => {
+      draft.checksConfirmedAt = new Date().toISOString();
+    });
+    this.toastr.success('发布前检查已重新确认。', '检查有效');
+  }
+
+  private validatePackage(value: unknown): { ok: true; package: RevisionPackage } | { ok: false; message: string } {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      return { ok: false, message: '包损坏：修订包必须是 JSON 对象。' };
+    }
+    const source = value as Record<string, unknown>;
+    if (source.kind !== REVISION_PACKAGE_KIND) {
+      return { ok: false, message: '包损坏：缺少修订包标识（kind），不是本工具生成的修订包。' };
+    }
+    const nonEmptyString = (item: unknown): item is string => typeof item === 'string' && item.trim().length > 0;
+    if (!nonEmptyString(source.id) || !nonEmptyString(source.noticeId) || !nonEmptyString(source.baseVersionId)
+      || !nonEmptyString(source.baseVersion) || !nonEmptyString(source.createdAt) || !nonEmptyString(source.author)) {
+      return { ok: false, message: '包损坏：修订包缺少必要字段（id、noticeId、baseVersionId、baseVersion、createdAt、author）。' };
+    }
+    if (!Array.isArray(source.changes)) {
+      return { ok: false, message: '包损坏：changes 字段必须是改动数组。' };
+    }
+    const changes: RevisionChange[] = [];
+    for (let index = 0; index < source.changes.length; index++) {
+      const rawChange = source.changes[index] as Record<string, unknown>;
+      if (typeof rawChange !== 'object' || rawChange === null) {
+        return { ok: false, message: `包损坏：第 ${index + 1} 项改动格式不正确。` };
+      }
+      if (!nonEmptyString(rawChange.key) || !nonEmptyString(rawChange.field) || !nonEmptyString(rawChange.label)
+        || typeof rawChange.baseValue !== 'string' || typeof rawChange.newValue !== 'string') {
+        return { ok: false, message: `包损坏：第 ${index + 1} 项改动缺少 key、field、label、baseValue 或 newValue。` };
+      }
+      if (rawChange.kind !== 'meta' && rawChange.kind !== 'language') {
+        return { ok: false, message: `包损坏：第 ${index + 1} 项改动的 kind 必须是 meta 或 language。` };
+      }
+      if (rawChange.kind === 'language' && !nonEmptyString(rawChange.locale)) {
+        return { ok: false, message: `包损坏：第 ${index + 1} 项语言改动缺少 locale。` };
+      }
+      changes.push({
+        key: rawChange.key,
+        kind: rawChange.kind as ChangeKind,
+        locale: typeof rawChange.locale === 'string' ? rawChange.locale : undefined,
+        field: rawChange.field,
+        label: rawChange.label,
+        baseValue: rawChange.baseValue,
+        newValue: rawChange.newValue
+      });
+    }
+    if (typeof source.checksum !== 'string' || !source.checksum) {
+      return { ok: false, message: '包损坏：缺少校验和 checksum。' };
+    }
+    const pkg: RevisionPackage = {
+      kind: REVISION_PACKAGE_KIND,
+      id: source.id,
+      noticeId: source.noticeId,
+      baseVersionId: source.baseVersionId,
+      baseVersion: source.baseVersion,
+      createdAt: source.createdAt,
+      author: source.author,
+      note: typeof source.note === 'string' ? source.note : undefined,
+      changes,
+      checksum: source.checksum
+    };
+    if (this.checksum(pkg) !== pkg.checksum) {
+      return { ok: false, message: '包损坏：校验和不匹配，包内容可能被篡改或损坏。' };
+    }
+    if (!changes.length) {
+      return { ok: false, message: '空包：修订包内没有任何改动字段，未导入。' };
+    }
+    return { ok: true, package: pkg };
+  }
+
+  private snapshotValue(snapshot: VersionSnapshot, change: RevisionChange): string | undefined {
+    if (change.kind === 'meta') {
+      return (snapshot as unknown as Record<string, string>)[change.field];
+    }
+    const language = snapshot.languages.find((item) => item.id === change.locale);
+    return language ? (language as unknown as Record<string, string>)[change.field] : undefined;
+  }
+
+  /** 把已校验的包合并进待复核稿：同字段同值不冲突，同字段不同值列为冲突。 */
+  private mergePackage(pkg: RevisionPackage): { added: number; conflicts: number } {
+    let added = 0;
+    let conflicts = 0;
+    this.commit((draft) => {
+      const review: PendingReview = draft.pendingReview
+        ? clone(draft.pendingReview)
+        : {
+          id: uid('pending'),
+          createdAt: new Date().toISOString(),
+          baseVersionId: pkg.baseVersionId,
+          baseVersion: pkg.baseVersion,
+          packages: [],
+          changes: [],
+          conflicts: []
+        };
+      review.packages.push(clone(pkg));
+      for (const change of pkg.changes) {
+        const conflict = review.conflicts.find((item) => item.key === change.key);
+        if (conflict) {
+          if (!conflict.candidates.some((candidate) => candidate.value === change.newValue)) {
+            conflict.candidates.push({
+              packageId: pkg.id, author: pkg.author, createdAt: pkg.createdAt, note: pkg.note, value: change.newValue
+            });
+          }
+          conflicts++;
+          continue;
+        }
+        const existing = review.changes.find((item) => item.key === change.key);
+        if (existing) {
+          if (existing.newValue !== change.newValue) {
+            review.changes = review.changes.filter((item) => item.key !== change.key);
+            review.conflicts.push({
+              id: uid('conflict'),
+              key: change.key,
+              kind: change.kind,
+              locale: change.locale,
+              field: change.field,
+              label: change.label,
+              baseValue: change.baseValue,
+              candidates: [
+                {
+                  packageId: existing.packageId,
+                  author: existing.author,
+                  createdAt: review.packages.find((item) => item.id === existing.packageId)?.createdAt ?? '',
+                  value: existing.newValue
+                },
+                { packageId: pkg.id, author: pkg.author, createdAt: pkg.createdAt, note: pkg.note, value: change.newValue }
+              ]
+            });
+            conflicts++;
+          }
+          continue;
+        }
+        review.changes.push({
+          key: change.key,
+          kind: change.kind,
+          locale: change.locale,
+          field: change.field,
+          label: change.label,
+          baseValue: change.baseValue,
+          newValue: change.newValue,
+          packageId: pkg.id,
+          author: pkg.author
+        });
+        added++;
+      }
+      draft.pendingReview = review;
+      draft.importedPackageIds = [...new Set([...(draft.importedPackageIds ?? []), pkg.id])];
+    });
+    return { added, conflicts };
+  }
+
+  /** 修订包完整性校验（FNV-1a，仅用于识别包损坏/篡改，非加密签名）。 */
+  private checksum(pkg: RevisionPackage): string {
+    const payload = JSON.stringify({
+      id: pkg.id,
+      noticeId: pkg.noticeId,
+      baseVersionId: pkg.baseVersionId,
+      baseVersion: pkg.baseVersion,
+      createdAt: pkg.createdAt,
+      author: pkg.author,
+      note: pkg.note ?? '',
+      changes: pkg.changes.map((change) => ({
+        key: change.key, kind: change.kind, locale: change.locale ?? '', field: change.field,
+        baseValue: change.baseValue, newValue: change.newValue
+      }))
+    });
+    let hash = 0x811c9dc5;
+    for (let index = 0; index < payload.length; index++) {
+      hash ^= payload.charCodeAt(index);
+      hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return `fnv1a-${hash.toString(16).padStart(8, '0')}`;
+  }
+
   formatDateTime(value: string): string {
     if (!value) return '未设置';
     const date = new Date(value);
@@ -669,6 +1246,16 @@ export class AppComponent implements OnInit {
     value.discussions ??= [];
     value.reviews ??= [];
     value.requiredLocales ??= ['zh-CN'];
+    value.importedPackageIds ??= [];
+    value.emergencyRevision ??= false;
+    if (value.pendingReview && (
+      typeof value.pendingReview !== 'object' ||
+      !Array.isArray(value.pendingReview.packages) ||
+      !Array.isArray(value.pendingReview.changes) ||
+      !Array.isArray(value.pendingReview.conflicts)
+    )) {
+      value.pendingReview = undefined;
+    }
     return value;
   }
 

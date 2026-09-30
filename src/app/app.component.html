@@ -42,6 +42,10 @@
       <button [class.active]="activeView === 'versions'" (click)="activeView = 'versions'">
         <span>04</span><strong>锁定与比较</strong><small>冻结、紧急修订、差异</small>
       </button>
+      <button [class.active]="activeView === 'merge'" (click)="activeView = 'merge'">
+        <span>05</span><strong>离线合并</strong><small>修订包导入与冲突裁决</small>
+        <b class="nav-badge" *ngIf="unresolvedConflictCount">{{ unresolvedConflictCount }}</b>
+      </button>
     </nav>
 
     <div *ngIf="draft.emergencyRevision" class="emergency-banner">
@@ -160,6 +164,15 @@
         <div><span class="eyebrow">发布门禁</span><h2>逐项检查通知是否可发布</h2><p>错误项会阻止版本锁定；警告项需要人工确认并承担责任。</p></div>
         <button nbButton status="danger" size="large" (click)="lockVersion()" [disabled]="isLocked">检查通过后锁定最终版本</button>
       </div>
+      <nb-alert status="danger" class="stale-checks" *ngIf="draft.emergencyRevision && !draft.checksConfirmedAt">
+        <strong>字段改动后发布前检查已失效。</strong>
+        离线合并带入了新的字段内容，请重新执行发布前检查并确认；受影响语言已标记待复核，相关角色重新确认后才能再次锁定。
+        <button nbButton size="small" status="danger" (click)="reconfirmChecks()">重新执行发布前检查</button>
+      </nb-alert>
+      <nb-alert status="success" class="stale-checks" *ngIf="draft.emergencyRevision && draft.checksConfirmedAt">
+        <strong>发布前检查已重新确认。</strong>
+        检查结果对当前修订稿有效；如再次改动字段，检查将再次失效。
+      </nb-alert>
       <div class="check-layout">
         <div class="check-list">
           <article *ngFor="let check of checks; let i = index" class="check-card" [class.error]="check.level === 'error'" [class.warning]="check.level === 'warning'" [class.info]="check.level === 'info'">
@@ -289,6 +302,152 @@
             </nb-card-body>
           </nb-card>
         </div>
+      </div>
+    </section>
+
+    <section *ngIf="activeView === 'merge'" class="view-section">
+      <div class="section-heading">
+        <div>
+          <span class="eyebrow">离线合并</span>
+          <h2>离线修订包导入与待复核合并</h2>
+          <p>外勤断网期间基于锁定稿分别修改标题、影响范围与多语言正文；修订包写清来自哪一锁定稿，只携带实际改过的字段。无冲突改动进入待复核稿，同一字段出现两种新值时列为待决冲突，全部裁决后才能生成正式修订稿。</p>
+        </div>
+      </div>
+
+      <nb-card class="panel pending-strip" *ngIf="draft.pendingReview">
+        <nb-card-body>
+          <div class="pending-strip-info">
+            <span class="status-pill">待复核稿</span>
+            <div>
+              <strong>基于锁定版本 {{ draft.pendingReview.baseVersion }} · {{ pendingPackages.length }} 个修订包 · {{ pendingChanges.length }} 项无冲突改动 · {{ pendingConflicts.length }} 项冲突</strong>
+              <p>冲突裁决前不会生成正式新稿，所有改动仅停留在待复核稿中。</p>
+            </div>
+          </div>
+          <div class="pending-strip-actions">
+            <button nbButton status="success" [disabled]="!allConflictsResolved" (click)="applyPendingReview()">生成正式修订稿</button>
+          </div>
+        </nb-card-body>
+      </nb-card>
+      <p class="lock-hint" *ngIf="draft.pendingReview && !allConflictsResolved">仍有 {{ unresolvedConflictCount }} 项冲突待决，处理后才能生成正式修订稿。</p>
+
+      <div class="merge-layout">
+        <div class="main-column">
+          <nb-card class="panel">
+            <nb-card-header>
+              <div><span class="section-kicker">网络恢复后</span><h3>导入离线修订包</h3></div>
+            </nb-card-header>
+            <nb-card-body>
+              <textarea nbInput fullWidth rows="6" [(ngModel)]="importText" placeholder="粘贴修订包 JSON 内容，或选择 .json 包文件导入…"></textarea>
+              <div class="import-actions">
+                <label class="file-btn">
+                  <input type="file" accept=".json,application/json" (change)="onPackageFileSelected($event)" hidden>
+                  <span class="nb-button-like">选择包文件</span>
+                </label>
+                <button nbButton status="primary" size="small" (click)="importRevisionPackage()">校验并导入</button>
+              </div>
+              <nb-alert *ngIf="lastImportResult" [status]="lastImportResult.ok ? 'success' : 'danger'" class="import-result">{{ lastImportResult.message }}</nb-alert>
+            </nb-card-body>
+          </nb-card>
+
+          <ng-container *ngIf="draft.pendingReview">
+            <nb-card class="panel">
+              <nb-card-header><div><span class="section-kicker">已导入</span><h3>修订包</h3></div><span class="count-pill">{{ pendingPackages.length }}</span></nb-card-header>
+              <nb-card-body>
+                <div class="package-row" *ngFor="let pkg of pendingPackages">
+                  <div class="package-meta">
+                    <strong>{{ pkg.author }}</strong>
+                    <span>{{ pkg.id }}</span>
+                    <time>{{ formatDateTime(pkg.createdAt) }}</time>
+                  </div>
+                  <p *ngIf="pkg.note" class="package-note">{{ pkg.note }}</p>
+                  <small>基于锁定稿 {{ pkg.baseVersion }} · {{ pkg.changes.length }} 项改动</small>
+                </div>
+                <p *ngIf="!pendingPackages.length" class="empty-copy">还没有导入任何修订包。</p>
+              </nb-card-body>
+            </nb-card>
+
+            <nb-card class="panel">
+              <nb-card-header><div><span class="section-kicker">可直接合入</span><h3>无冲突改动</h3></div><span class="count-pill">{{ pendingChanges.length }}</span></nb-card-header>
+              <nb-card-body>
+                <div class="change-row" *ngFor="let change of pendingChanges">
+                  <div class="change-label">{{ change.label }}<small>{{ change.author }}</small></div>
+                  <div class="change-values"><span class="old">{{ change.baseValue || '（空）' }}</span><span class="arrow">→</span><span class="new">{{ change.newValue }}</span></div>
+                </div>
+                <p *ngIf="!pendingChanges.length" class="empty-copy">没有无冲突改动。</p>
+              </nb-card-body>
+            </nb-card>
+
+            <nb-card class="panel">
+              <nb-card-header><div><span class="section-kicker">待决冲突</span><h3>同一字段的不同新值</h3></div><span class="count-pill danger">{{ pendingConflicts.length }}</span></nb-card-header>
+              <nb-card-body>
+                <p *ngIf="!pendingConflicts.length" class="empty-copy">没有待决冲突，可以生成正式修订稿。</p>
+                <div class="conflict-card" *ngFor="let conflict of pendingConflicts" [class.resolved]="conflict.selectedPackageId || (conflict.customValue ?? '').trim()">
+                  <div class="conflict-head">
+                    <strong>{{ conflict.label }}</strong>
+                    <span class="conflict-base">原值：{{ conflict.baseValue || '（空）' }}</span>
+                  </div>
+                  <div class="conflict-options">
+                    <label class="conflict-option" *ngFor="let candidate of conflict.candidates">
+                      <input type="radio" [name]="conflict.id" [checked]="conflict.selectedPackageId === candidate.packageId" (change)="selectConflictCandidate(conflict, candidate.packageId)">
+                      <div>
+                        <strong>{{ candidate.author }}</strong><time>{{ formatDateTime(candidate.createdAt) }}</time>
+                        <blockquote>{{ candidate.value }}</blockquote>
+                      </div>
+                    </label>
+                  </div>
+                  <div class="conflict-custom">
+                    <span>或以值班编辑身份手动裁定：</span>
+                    <input nbInput fullWidth [ngModel]="conflict.customValue ?? ''" (ngModelChange)="setConflictCustom(conflict, $event)" placeholder="输入裁定值…">
+                  </div>
+                  <div class="conflict-status" *ngIf="conflict.selectedPackageId || (conflict.customValue ?? '').trim()">已裁定</div>
+                </div>
+              </nb-card-body>
+            </nb-card>
+          </ng-container>
+        </div>
+
+        <aside>
+          <nb-card class="panel">
+            <nb-card-header><div><span class="section-kicker">外勤离线填写</span><h3>生成离线修订包</h3></div></nb-card-header>
+            <nb-card-body>
+              <label class="field"><span>基于锁定稿 *</span>
+                <nb-select fullWidth [ngModel]="builderBaseVersionId" (ngModelChange)="selectBuilderBase($event)">
+                  <nb-option *ngFor="let version of draft.versions" [value]="version.id">{{ version.version }} · {{ version.label }}</nb-option>
+                </nb-select>
+              </label>
+              <label class="field"><span>外勤人员</span><input nbInput fullWidth [ngModel]="builderAuthor" (ngModelChange)="builderAuthor = $event" placeholder="姓名"></label>
+              <label class="field"><span>备注</span><input nbInput fullWidth [ngModel]="builderNote" (ngModelChange)="builderNote = $event" placeholder="选填"></label>
+              <label class="field"><span>通知标题</span><input nbInput fullWidth [ngModel]="builderTitle" (ngModelChange)="builderTitle = $event"></label>
+              <label class="field"><span>影响范围</span><input nbInput fullWidth [ngModel]="builderScope" (ngModelChange)="builderScope = $event"></label>
+              <div class="builder-language" *ngFor="let language of builderBaseSnapshot?.languages">
+                <div class="builder-lang-head">{{ language.name }}</div>
+                <label class="field"><span>标题</span><input nbInput fullWidth [ngModel]="builderLanguageValue(language.id, 'title')" (ngModelChange)="setBuilderLanguage(language.id, 'title', $event)"></label>
+                <label class="field"><span>正文</span><textarea nbInput fullWidth rows="5" [ngModel]="builderLanguageValue(language.id, 'body')" (ngModelChange)="setBuilderLanguage(language.id, 'body', $event)"></textarea></label>
+              </div>
+              <div class="builder-changes">
+                <strong>实际改动 {{ builderChanges.length }} 项</strong>
+                <ul *ngIf="builderChanges.length">
+                  <li *ngFor="let change of builderChanges">{{ change.label }}</li>
+                </ul>
+                <p *ngIf="!builderChanges.length" class="empty-copy">未修改任何字段，导出的将是空包。</p>
+              </div>
+              <div class="builder-actions">
+                <button nbButton status="primary" size="small" (click)="exportRevisionPackage()">导出包文件</button>
+                <button nbButton status="basic" size="small" (click)="copyRevisionPackage()">复制 JSON</button>
+              </div>
+            </nb-card-body>
+          </nb-card>
+
+          <nb-card class="panel compact">
+            <nb-card-header><div><span class="section-kicker">合并规则</span><h3>规则说明</h3></div></nb-card-header>
+            <nb-card-body class="rules">
+              <p>· 修订包必须写清来自哪一锁定稿，且只携带实际改过的字段。</p>
+              <p>· 基础版本过期、包损坏、同一包重复导入都会给出明确结果，不会静默合并。</p>
+              <p>· 无冲突改动进入待复核稿；同一字段出现两种新值列为待决冲突。</p>
+              <p>· 冲突全部裁定后才生成正式修订稿；受影响语言复核与发布前检查失效，责任角色重新确认后才能再次锁定。</p>
+            </nb-card-body>
+          </nb-card>
+        </aside>
       </div>
     </section>
   </nb-layout-column>
